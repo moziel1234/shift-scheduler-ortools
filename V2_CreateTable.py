@@ -1,7 +1,7 @@
 import openpyxl
 from py._builtin import enumerate
 
-days = 6
+days = 7
 shifts = 4
 wb = openpyxl.load_workbook(rf"העדפות שמירה.xlsx", data_only=True)
 sheet = wb['Sheet1']

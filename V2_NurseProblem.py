@@ -47,7 +47,12 @@ def plan_shifts(
     min_shifts_per_person: Union[int, List[int]] = 0,
     max_shifts_per_person: Union[int, List[int]] = 999,
     min_rest_hours: float = 8.0,
-    time_limit_seconds: int = 20
+    time_limit_seconds: int = 20,
+    avoid_double_shift_pairs_daywise: List[Tuple[int, str, int, str]] = None,
+    double_shift_penalty_weight: int = 50,
+    soft_single_shift_weight: int = 20,
+
+
 ):
     P = len(names)
     if num_days is None:
@@ -148,13 +153,46 @@ def plan_shifts(
             total_shifts = sum(assign[(p, d, s)] for d in range(num_days) for s in shift_names)
             model.Add(total_shifts == target_shifts[person_name])
 
+    # 7) soft penalties: avoid same person assigned to both specified (day, shift) pairs
+    double_shift_penalties = []
+    if avoid_double_shift_pairs_daywise:
+        for (day_a, shift_a, day_b, shift_b) in avoid_double_shift_pairs_daywise:
+            for p in range(P):
+                both = model.NewBoolVar(f"both_p{p}_d{day_a}_{shift_a}_d{day_b}_{shift_b}")
+                model.AddBoolAnd([assign[(p, day_a, shift_a)], assign[(p, day_b, shift_b)]]).OnlyEnforceIf(both)
+                model.AddBoolOr([
+                    assign[(p, day_a, shift_a)].Not(),
+                    assign[(p, day_b, shift_b)].Not()
+                ]).OnlyEnforceIf(both.Not())
+                double_shift_penalties.append(both)
+
+    # 8) soft penalty: prefer at most one shift per person per day
+    multi_shift_penalties = []
+    for p in range(P):
+        for d in range(num_days):
+            shifts_today = [assign[(p, d, s)] for s in shift_names]
+            # number of assigned shifts that day
+            total_today = sum(shifts_today)
+            # penalize each shift beyond the first
+            # (since BoolVars, this expression is linear)
+            excess_expr = total_today - 1
+            # only positive part should be penalized
+            # but CP-SAT doesn't have max(), so we just rely on objective minimizing this
+            # because excess_expr will be 0 if <=1, >0 if more
+            multi_shift_penalties.append(excess_expr)
+
+
     # balancing term
     max_shifts_var = model.NewIntVar(0, num_days * len(shift_names), "max_shifts")
     for p in range(P):
         model.Add(sum(assign[(p, d, s)] for d in range(num_days) for s in shift_names) <= max_shifts_var)
 
-    # objective: maximize preferences, then balance
-    model.Maximize(1000 * sum(preference_terms) - max_shifts_var)
+    model.Maximize(
+        1000 * sum(preference_terms)
+        - max_shifts_var
+        - double_shift_penalty_weight * sum(double_shift_penalties)
+        - soft_single_shift_weight * sum(multi_shift_penalties)
+    )
 
     # solve
     solver = cp_model.CpSolver()
@@ -171,11 +209,46 @@ def plan_shifts(
                     if solver.Value(assign[(p, d, s)]):
                         solution[(names[p], d, s)] = 1
                         shift_counts[names[p]] += 1
+
+        # ---- check for double-shift occurrences ----
+        double_shift_status = []
+        if avoid_double_shift_pairs_daywise:
+            for (day_a, shift_a, day_b, shift_b) in avoid_double_shift_pairs_daywise:
+                violators = []
+                for p, person_name in enumerate(names):
+                    val_a = solver.Value(assign[(p, day_a, shift_a)])
+                    val_b = solver.Value(assign[(p, day_b, shift_b)])
+                    if val_a and val_b:
+                        violators.append(person_name)
+                if violators:
+                    double_shift_status.append({
+                        "pair": (day_a, shift_a, day_b, shift_b),
+                        "violators": violators
+                    })
+                else:
+                    double_shift_status.append({
+                        "pair": (day_a, shift_a, day_b, shift_b),
+                        "violators": []
+                    })
+
+        multi_shift_status = []
+        for p, person_name in enumerate(names):
+            multi_days = []
+            for d in range(num_days):
+                shifts_today = [s for s in shift_names if solver.Value(assign[(p, d, s)])]
+                if len(shifts_today) > 1:
+                    multi_days.append((d, shifts_today))
+            if multi_days:
+                multi_shift_status.append({"person": person_name, "days": multi_days})
+
+        # Add to return
         return {
             "status": solver.StatusName(result),
             "solution": solution,
             "shift_counts": shift_counts,
-            "objective": solver.ObjectiveValue()
+            "objective": solver.ObjectiveValue(),
+            "double_shift_status": double_shift_status,
+            "multi_shift_status": multi_shift_status
         }
     else:
         return None
@@ -360,37 +433,41 @@ def print_solution_by_day(solution, shift_requirements, num_days):
 # Example usage
 # --------------------------
 if __name__ == "__main__":
-    names = ['אביב ברזל', 'אברהם דיאמנד', 'אהרון רוטנברג', 'אוהד אלקיים', 'אור חבזה', 'משה עוזיאל', 'אלעד מאיר',
-             'אסף ברזיס', 'דביר רוזנברג', 'דין קרמזין', 'יאיר בן יוסף', 'יאיר מימון', 'יואל שפץ', 'יובל ברוכיאן',
-             'יונתן פרידלנדר', 'יפתח בן זמרה', 'מאיר סמסון', 'משה וילנסקי', 'משה ליפן', 'עודד טובולסקי', 'עקיבא עמיאל',
-             'רונן איזיק', 'רזיאל זקבך ']
+
+    names = ['אברהם דיאמנד', 'אהרון רוטנברג', 'אוהד אלקיים', 'אור חבזה', 'אסף ברזיס', 'דביר רוזנברג', 'דין קרמזין',
+             'יאיר בן יוסף', 'יובל ברוכיאן', 'יפתח בן זמרה', 'עודד טובולסקי', 'רונן איזיק', 'רזיאל זקבך']
     shift_requests = [
-        [[-1, -1, -1, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, -1, 0], [0, -1, -1, 0], [-1, -1, -1, -1]],  # אביב ברזל
-        [[0, 0, -1, -1], [0, -1, -1, 0], [0, 0, 0, 0], [0, 0, -1, 0], [0, -1, 0, 0], [0, 0, 0, 0]],  # אברהם דיאמנד
-        [[-1, 0, -1, -1], [-1, -1, -1, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],  # אהרון רוטנברג
-        [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],  # אוהד אלקיים
-        [[0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1]],  # אור חבזה
-        [[0, 0, 0, 1], [0, 0, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1], [1, 0, 0, 0], [0, 0, 1, 0]],  # משה עוזיאל
-        [[0, 0, 0, 0], [0, 0, 0, 0], [-1, -1, -1, -1], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],  # אלעד מאיר
-        [[1, 0, 0, 0], [-1, -1, -1, -1], [1, 0, 0, 0], [1, 0, 0, 0], [-1, -1, -1, -1], [1, 0, 0, 0]],  # אסף ברזיס
-        [[-1, 0, 0, 0], [0, 0, 0, 0], [-1, -1, -1, -1], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],  # דביר רוזנברג
-        [[-1, 0, 0, 0], [0, 0, 0, 0], [-1, -1, -1, -1], [1, 0, -1, 0], [0, 0, 0, 0], [1, 0, -1, 1]],  # דין קרמזין
-        [[0, 1, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0], [0, 1, 0, 0], [-1, -1, -1, -1], [0, 0, 0, 1]],  # יאיר בן יוסף
-        [[-1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],  # יאיר מימון
-        [[1, 0, -1, -1], [-1, -1, 1, 0], [0, 0, 1, 1], [1, 0, -1, -1], [0, -1, -1, -1], [0, -1, 0, 0]],  # יואל שפץ
-        [[-1, 1, -1, -1], [-1, -1, -1, 0], [0, 0, 1, 0], [0, 1, -1, 0], [0, -1, 1, 0], [-1, -1, 1, 0]],  # יובל ברוכיאן
-        [[0, 0, 0, 0], [0, 0, 1, 0], [-1, -1, -1, -1], [0, 0, 0, 0], [0, 0, 0, 0], [1, 0, 0, 0]],  # יונתן פרידלנדר
-        [[0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1]],  # יפתח בן זמרה
-        [[0, 1, 0, -1], [0, 0, 0, 1], [0, -1, 1, 0], [0, 0, 0, 1], [0, 0, 0, 0], [0, 0, 0, 0]],  # מאיר סמסון
-        [[0, 1, -1, -1], [-1, -1, -1, -1], [0, 0, 1, 0], [0, 0, -1, -1], [0, -1, 1, 0], [0, 1, 0, 0]],  # משה וילנסקי
-        [[1, -1, -1, 0], [1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0]],  # משה ליפן
-        [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]],  # עודד טובולסקי
-        [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],  # עקיבא עמיאל
-        [[-1, 0, 0, 0], [0, 0, 0, 0], [-1, -1, -1, -1], [0, 0, 0, 0], [0, -1, 0, 0], [0, -1, -1, -1]],  # רונן איזיק
-        [[1, 0, 0, -1], [0, -1, 0, 0], [0, -1, -1, -1], [-1, 0, 0, -1], [0, 0, 0, 1], [0, 0, 0, 0]],  # רזיאל זקבך
+        [[0, 0, -1, -1], [0, 0, -1, 0], [0, -1, 0, 0], [0, 0, 0, 0], [0, 0, -1, -1], [0, 0, -1, -1], [0, 0, 0, 0]],
+        # אברהם דיאמנד
+        [[-1, -1, -1, -1], [0, 0, -1, 0], [0, -1, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+        # אהרון רוטנברג
+        [[-1, 0, 1, 0], [-1, -1, -1, -1], [-1, -1, -1, 0], [0, 0, 1, 0], [0, 0, 1, 0], [0, 0, 1, 0], [0, 1, 0, 0]],
+        # אוהד אלקיים
+        [[-1, -1, -1, -1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1]],
+        # אור חבזה
+        [[1, 0, 0, 0], [1, -1, -1, -1], [-1, -1, -1, -1], [1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0]],
+        # אסף ברזיס
+        [[0, 1, 0, 0], [0, 1, -1, 0], [-1, -1, -1, -1], [0, 1, 0, 0], [0, 1, -1, 0], [0, 1, 0, 0], [0, 0, 0, 0]],
+        # דביר רוזנברג
+        [[0, 0, 1, 0], [1, -1, -1, -1], [-1, -1, -1, -1], [0, 0, 1, 0], [0, 0, 1, 0], [0, 0, 1, 0], [0, 0, 0, 0]],
+        # דין קרמזין
+        [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]],
+        # יאיר בן יוסף
+        [[-1, 0, 1, 0], [1, 0, 0, 0], [1, 0, 0, 0], [-1, -1, 0, 0], [-1, -1, 0, 0], [-1, -1, 1, 0], [0, 0, 0, 0]],
+        # יובל ברוכיאן
+        [[0, -1, 0, 1], [0, -1, -1, -1], [1, 0, 0, -1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 1], [0, 0, 0, 0]],
+        # יפתח בן זמרה
+        [[0, 0, -1, -1], [0, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [-1, -1, -1, -1], [-1, 0, 0, -1]],
+        # עודד טובולסקי
+        [[-1, 0, -1, 0], [1, -1, 0, 0], [0, -1, 0, 0], [0, -1, 0, -1], [-1, -1, 1, 0], [-1, -1, -1, -1], [0, 0, 0, 0]],
+        # רונן איזיק
+        [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 1], [0, 0, 0, 1], [1, 0, 0, 0], [1, 0, 0, 0], [-1, -1, -1, -1]],
+        # רזיאל זקבך
     ]
 
-    num_days = 6
+
+
+    num_days = 7
     '''cols_to_keep = [0, 1]  # indices of columns you want to keep
     shift_requests = [[row[i] for i in cols_to_keep] for row in shift_requests]'''
 
@@ -404,78 +481,24 @@ if __name__ == "__main__":
         "יזומה 149 בוקר": [(6,9),(17,18.5)],
         "יזומה 149 בוקר ק": [(6,9)],
         "יזומה 149 ערב": [(18.5,23)],
-        "דרום 18-24": [(18,24)],
-        "הורדיון 09-13": [(9,13)],
-        "הורדיון 13-17": [(13,17)],
+        "דרום 18-24": [(18,24)]
     }
 
 
     shift_requirements = {
-        "03:00-09:00":      [2, 4, 2, 2, 4, 2],  # Day0 → 2 persons, Day1 → 1 person, Day2 → 2 persons
-        "09:00-15:00":      [2, 4, 2, 2, 4, 2],
-        "15:00-21:00":      [4, 4, 2, 4, 4, 2],
-        "21:00-03:00":      [4, 2, 2, 4, 2, 2],
-        "יזומה 149 בוקר ק":  [3, 0, 0, 3, 0, 0],
-        "יזומה 149 בוקר":    [0, 0, 3, 0, 0, 3],
-        "יזומה 149 ערב":     [0, 0, 3, 0, 0, 3],
-        "דרום 18-24":        [0, 0, 1, 0, 0, 1],
-        "הורדיון 09-13":     [3, 0, 0, 0, 0, 0],
-        "הורדיון 13-17":     [3, 0, 0, 0, 0, 0],
+        "03:00-09:00":          [1, 2, 2, 2, 2, 2, 1 ],  # Day0 → 2 persons, Day1 → 1 person, Day2 → 2 persons
+        "09:00-15:00":          [1, 2, 3, 0, 0, 0, 0  ],
+        "15:00-21:00":          [1, 2, 2, 0, 1, 0, 1 ],
+        "21:00-03:00":          [2, 3, 2, 2, 1, 1, 2  ],
+        "יזומה 149 בוקר ק":      [0, 2, 0, 0, 0, 0, 0  ],
+        "יזומה 149 בוקר":        [3, 0, 0, 2, 3, 3, 3  ],
+        "יזומה 149 ערב":         [3, 0, 0, 3, 3, 3, 2  ],
+        "דרום 18-24":            [0, 0, 0, 0, 0, 1, 1  ],
     }
 
 
-    '''# Build nested dict per day
-    days_shifts = [
-        # Day 0
-        {
-            "03:00-09:00": ["אסף ברזיס", "דין קרמזין"],
-            "יזומה 149 בוקר": ["אוהד אלקיים", "אברהם דיאמנד", "רזיאל זקבך"],
-            "09:00-15:00": ["יואל שפץ", "עודד טובולסקי"],
-            "15:00-21:00": ["יונתן פרידלנדר", "מאיר סמסון"],
-            "יזומה 149 ערב": ["דביר רוזנברג", "אביב ברזל", "משה עוזיאל"],
-            "דרום 18-24": ["אהרון רוטנברג"],
-            "21:00-03:00": ["רונן איזיק", "יפתח בן זמרה"]
-        },
-        # Day 1
-        {
-            "03:00-09:00": ["משה וילנסקי", "דין קרמזין"],
-            "09:00-15:00": ["יובל ברוכיאן", "אביב ברזל"],
-            "15:00-21:00": ["יאיר מימון", "אסף ברזיס", "אור חבזה"],
-            "דרום 18-24": ["אלעד מאיר"],
-            "21:00-03:00": ["יואל שפץ", "עקיבא עמיאל"]
-        }
-    ]
-
-    # Convert to solution dict
-    solution = build_solution_dict(names, days_shifts)
-
-    violations = check_solution(
-        solution=solution,
-        names=names,
-        shift_requests=shift_requests,
-        STANDARD_SHIFTS=STANDARD_SHIFTS,
-        shift_time_map=shift_time_map,
-        shift_requirements=shift_requirements,
-        min_shifts_per_person=0,
-        max_shifts_per_person=3,
-        min_rest_hours=8
-    )
-
-    if violations:
-        print("❌ Violations found:")
-        for v in violations:
-            print(" -", v)
-    else:
-        print("✅ Solution is valid")
-    '''
 
     target_shifts = {
-        "משה ליפן" : 5,
-        "אהרון רוטנברג" : 3,
-        "אוהד אלקיים" : 3,
-        "דין קרמזין" : 3,
-        "רזיאל זקבך" : 3,
-        "משה עוזיאל" : 4,
     }
 
     out = plan_shifts(
@@ -486,16 +509,41 @@ if __name__ == "__main__":
         target_shifts=target_shifts,
         num_days=num_days,
         shift_requirements=shift_requirements,
-        min_shifts_per_person=3,
-        max_shifts_per_person=5,
-        min_rest_hours=8,
-        time_limit_seconds=100
+        min_shifts_per_person=5,
+        max_shifts_per_person=6,
+        min_rest_hours=12,
+        time_limit_seconds=100,
+        avoid_double_shift_pairs_daywise=[
+            (1, "15:00-21:00", 2, "09:00-15:00")
+        ],
+        double_shift_penalty_weight=50,
+        soft_single_shift_weight = 20,
     )
+
 
     if out:
         print("Status:", out["status"])
         print("Objective:", out["objective"])
         print("Shift counts:", out["shift_counts"])
+        if "double_shift_status" in out:
+            print("\nDouble-shift pair summary:")
+            for entry in out["double_shift_status"]:
+                day_a, shift_a, day_b, shift_b = entry["pair"]
+                violators = entry["violators"]
+                if violators:
+                    print(
+                        f" ⚠️ Pair ({day_a}:{shift_a}) → ({day_b}:{shift_b}) has {len(violators)} violators: {', '.join(violators)}")
+                else:
+                    print(f" ✅ Pair ({day_a}:{shift_a}) → ({day_b}:{shift_b}) has no violators.")
+
+        if out.get("multi_shift_status"):
+            print("\nMultiple-shift-per-day summary:")
+            for entry in out["multi_shift_status"]:
+                days_info = ", ".join([f"Day {d}: {', '.join(shifts)}" for d, shifts in entry["days"]])
+                print(f" ⚠️ {entry['person']} has multiple shifts on {days_info}")
+        else:
+            print("\n✅ No one has multiple shifts per day.")
+
         print("Assignments:")
         '''for (p,d,s),v in out["solution"].items():
             print(f" Day {d}, {s} -> {p}")'''
